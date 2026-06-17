@@ -1,4 +1,4 @@
-import express, { Application } from 'express';
+import express, { Application, Request, Response, NextFunction } from 'express';
 import { createServer } from 'http';
 import cors from 'cors';
 import helmet from 'helmet';
@@ -6,18 +6,24 @@ import compression from 'compression';
 import morgan from 'morgan';
 import dotenv from 'dotenv';
 import path from 'path';
+import fs from 'fs';
 
 import { pool } from './config/database';
 import { redisClient } from './config/redis';
 import routes from './routes';
 import { WebSocketServer } from './websocket/websocket.server';
-import { query } from './config/database';
 
 dotenv.config();
 
 const app: Application = express();
 const httpServer = createServer(app);
 const PORT = process.env.PORT || 3000;
+
+// Cria pasta uploads se não existir
+const uploadsDir = path.join(__dirname, '../uploads');
+if (!fs.existsSync(uploadsDir)) {
+  fs.mkdirSync(uploadsDir, { recursive: true });
+}
 
 // Middleware
 app.use(helmet());
@@ -31,25 +37,32 @@ app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 // Serve uploaded files
-app.use('/uploads', express.static(path.join(__dirname, '../uploads')));
+app.use('/uploads', express.static(uploadsDir));
 
 // Routes
 app.use('/api', routes);
 
-// Health check
-app.get('/health', async (req, res) => {
+// Health check - sem reconectar Redis
+app.get('/health', async (req: Request, res: Response) => {
   try {
     await pool.query('SELECT 1');
-    await redisClient.connect();
-    res.json({ status: 'ok', timestamp: new Date().toISOString() });
-  } catch (error) {
-    res.status(503).json({ status: 'error', error: error });
+    await redisClient.ping();
+    res.json({ 
+      status: 'ok', 
+      timestamp: new Date().toISOString(),
+      uptime: process.uptime()
+    });
+  } catch (error: any) {
+    res.status(503).json({ 
+      status: 'error', 
+      error: error.message 
+    });
   }
 });
 
 // Error handler
-app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
-  console.error(err.stack);
+app.use((err: any, req: Request, res: Response, next: NextFunction) => {
+  console.error('[ERROR]', err.stack);
   res.status(err.status || 500).json({
     error: err.message || 'Internal server error',
   });
@@ -61,14 +74,18 @@ const wsServer = new WebSocketServer(httpServer);
 // Start server
 async function startServer() {
   try {
-    // Connect to Redis
-    await redisClient.connect();
+    // Connect to Redis - só 1x
+    if (!redisClient.isOpen) {
+      await redisClient.connect();
+      console.log('✅ Redis connected');
+    }
 
-    // Initialize database
-    await initializeDatabase();
+    // Testa conexão com DB
+    await pool.query('SELECT NOW()');
+    console.log('✅ Database connected');
 
-    // Start listening
-    httpServer.listen(PORT, () => {
+    // Start listening - 0.0.0.0 obrigatório no Render
+    httpServer.listen(PORT, '0.0.0.0', () => {
       console.log(`🚀 Block Chat Server running on port ${PORT}`);
       console.log(`🔒 Privacidade em cada bloco`);
     });
@@ -78,23 +95,20 @@ async function startServer() {
   }
 }
 
-async function initializeDatabase() {
-  try {
-    // Run migrations
-    const schema = require('fs').readFileSync(
-      path.join(__dirname, 'database/schema.sql'),
-      'utf8'
-    );
-    await pool.query(schema);
-    console.log('✅ Database initialized');
-  } catch (error) {
-    console.error('Database initialization error:', error);
-  }
-}
-
 // Graceful shutdown
 process.on('SIGTERM', async () => {
   console.log('SIGTERM received, shutting down gracefully...');
+  await redisClient.quit();
+  await pool.end();
+  httpServer.close(() => {
+    console.log('Server closed');
+    process.exit(0);
+  });
+});
+
+process.on('SIGINT', async () => {
+  console.log('SIGINT received, shutting down gracefully...');
+  await redisClient.quit();
   await pool.end();
   process.exit(0);
 });
