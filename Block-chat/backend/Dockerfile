@@ -15,6 +15,9 @@ RUN npm run build
 # Create uploads directory
 RUN mkdir -p uploads
 
+# Render usa a PORT que ele define
+ENV PORT=3000
 EXPOSE 3000
 
-CMD ["npm", "start"]
+# Usa node direto ao invés de npm pra pegar SIGTERM
+CMD ["node", "dist/server.js"]
